@@ -1,12 +1,11 @@
-import requests
-from bs4 import BeautifulSoup
-import google.generativeai as genai
 import os
-import json
-from postmarker.core import PostmarkClient
 import time
-import html 
+import requests
+import google.generativeai as genai
+
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from postmarker.core import PostmarkClient
 
 # Load environment variables from .env file
 load_dotenv()
