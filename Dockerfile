@@ -8,16 +8,15 @@ WORKDIR /usr/src/app
 COPY requirements.txt ./
 
 # Install any needed packages specified in requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code into the container
 COPY . .
 
 # Make port 80 available to the world outside this container
-EXPOSE 80
+EXPOSE 8080
 
-# Define environment variable
-# ENV NAME World
+ENV PYTHONPATH="/usr/src/app"
 
 # Run app.py when the container launches
 CMD ["python", "./app.py"]
