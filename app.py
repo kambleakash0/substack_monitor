@@ -1,21 +1,20 @@
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
 import os
+import json
+from postmarker.core import PostmarkClient
 import time
+import html 
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
-
-
 # Configuration
 SUBSTACK_URL = os.getenv("SUBSTACK_BLOG_URL")  # Your Substack URL
 GOOGLE_AI_API_KEY = os.getenv("GEMINI_API_KEY")  # Get this from Google AI Studio
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")  # Get this from SendGrid
+POSTMARK_SERVER_TOKEN = os.getenv("POSTMARK_API_TOKEN")  # Get this from SendGrid
 SENDER_EMAIL = os.getenv("EMAIL_SENDER")  # Your email address
 RECEIVER_EMAILS = os.getenv("EMAIL_RECEIVERS")  # Your email address
 STATE_FILE = "last_processed.txt"  # File to store the last processed URL
@@ -24,22 +23,28 @@ SLEEP_SECONDS = int(os.getenv("CHECK_INTERVAL")) # Check every 60 minutes
 # Configure Gemini
 genai.configure(api_key=GOOGLE_AI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-pro-latest')
-
 # model = genai.GenerativeModel('gemini-pro')  
 # Or 'gemini-pro-vision' if you need image support
 
+# Global vars
+last_processed = ""
+
 def get_last_processed_url():
-    """Reads the last processed URL from the state file."""
-    try:
-        with open(STATE_FILE, "r") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return None
+    """Reads the last processed URL from the global variable."""
+    global last_processed
+    return last_processed
+    # try:
+    #     with open(STATE_FILE, "r") as f:
+    #         return f.read().strip()
+    # except FileNotFoundError:
+    #     return None
 
 def save_last_processed_url(url):
-    """Saves the last processed URL to the state file."""
-    with open(STATE_FILE, "w") as f:
-        f.write(url)
+    """Saves the last processed URL to the global variable."""
+    global last_processed
+    last_processed = url
+    # with open(STATE_FILE, "w") as f:
+    #     f.write(url)
 
 def get_latest_substack_post_url(substack_url):
     """Fetches the Substack homepage and extracts the URL of the latest post."""
@@ -85,7 +90,11 @@ def summarize_text(text, api_key):
     """Summarizes the text using Google's Gemini API."""
     try:
         
-        prompt = f"Summarize the following text:\n{text}\n\nSummary:"
+        prompt = f"Summarize the following text and \
+            format it to be sent as HtmlBody parameter in a email API. \
+                Don't add triple backticks to denote the block of text. \
+                simply the HTML without even HEAD or BODY tags.\
+                \n{text}\n\nSummary:"
         response = model.generate_content(prompt)
 
         if response.prompt_feedback and response.prompt_feedback.block_reason:
@@ -98,25 +107,18 @@ def summarize_text(text, api_key):
         print(f"Error during Gemini summarization: {e}")
         return None
 
-def send_email(subject, body, sender_email, receiver_email, sendgrid_api_key):
-    """Sends an email using Twilio SendGrid API."""
-    message = Mail(
-        from_email=sender_email,
-        to_emails=receiver_email,
-        subject=subject,
-        html_content=body
+def send_simple_message(subject, body, sender_email, receiver_email, postmark_server_token):
+    postmark = PostmarkClient(server_token=postmark_server_token)
+    
+    print(
+        postmark.emails.send(
+            From=sender_email,
+            To=receiver_email,
+            Subject=subject,
+            HtmlBody="<p>" + body.replace("\n", "</p><p>") + "</p>",
+            # MessageStream='eas-503-notification', # Optional
+            )
     )
-
-    try:
-        sg = SendGridAPIClient(os.environ.get(sendgrid_api_key))
-        response = sg.send(message)
-
-        if response.status_code == 202:
-            print("Email sent successfully via SendGrid!")
-        else:
-            print(f"Error sending email via SendGrid. Status code: {response.status_code}, Body: {response.body}, Headers: {response.headers}")
-    except Exception as e:
-        print(f"Error sending email via SendGrid: {e}")
 
 def main():
     """Main function to orchestrate the process."""
@@ -147,16 +149,17 @@ def main():
                 continue
 
             print(f"Summary of {latest_post_url}:\n\n{summary}")
-            # send_email(
-            #     subject="Summary of the latest EAS503 Substack post",
-            #     body=f"Summary of {latest_post_url}:\n\n{summary}",
-            #     sender_email=SENDER_EMAIL,
-            #     receiver_email=RECEIVER_EMAILS,
-            #     sendgrid_api_key=SENDGRID_API_KEY,
-            # )
+            
+            send_simple_message(
+                subject="Summary of the latest EAS503 Substack post",
+                body=f"Summary of {latest_post_url}:\n\n{summary}",
+                sender_email=SENDER_EMAIL,
+                receiver_email=RECEIVER_EMAILS,
+                postmark_server_token=POSTMARK_SERVER_TOKEN,
+            )
 
-            # save_last_processed_url(latest_post_url)
-            # last_processed_url = latest_post_url #Update in memory
+            save_last_processed_url(latest_post_url)
+            last_processed_url = latest_post_url #Update in memory
 
         else:
             print("No new posts found.")
@@ -166,3 +169,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # send_simple_message()
