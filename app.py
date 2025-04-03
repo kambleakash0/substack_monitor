@@ -1,11 +1,22 @@
 import os
 import time
 import requests
+import threading
 import google.generativeai as genai
+import logging
+import uvicorn
+from fastapi import FastAPI
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from postmarker.core import PostmarkClient
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Create FastAPI app
+app = FastAPI(title="Substack Monitor Service")
 
 # Load environment variables from .env file
 load_dotenv()
@@ -16,34 +27,26 @@ GOOGLE_AI_API_KEY = os.getenv("GEMINI_API_KEY")  # Get this from Google AI Studi
 POSTMARK_SERVER_TOKEN = os.getenv("POSTMARK_API_TOKEN")  # Get this from SendGrid
 SENDER_EMAIL = os.getenv("EMAIL_SENDER")  # Your email address
 RECEIVER_EMAILS = os.getenv("EMAIL_RECEIVERS")  # Your email address
-STATE_FILE = "last_processed.txt"  # File to store the last processed URL
-SLEEP_SECONDS = int(os.getenv("CHECK_INTERVAL")) # Check every 60 minutes
+SLEEP_SECONDS = int(os.getenv("CHECK_INTERVAL", "3600"))  # Default to 1 hour if not specified
 
 # Configure Gemini
 genai.configure(api_key=GOOGLE_AI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-pro-latest')
-# model = genai.GenerativeModel('gemini-pro')  
-# Or 'gemini-pro-vision' if you need image support
 
 # Global vars
 last_processed = ""
+worker_active = False
+worker_thread = None
 
 def get_last_processed_url():
     """Reads the last processed URL from the global variable."""
     global last_processed
     return last_processed
-    # try:
-    #     with open(STATE_FILE, "r") as f:
-    #         return f.read().strip()
-    # except FileNotFoundError:
-    #     return None
 
 def save_last_processed_url(url):
     """Saves the last processed URL to the global variable."""
     global last_processed
     last_processed = url
-    # with open(STATE_FILE, "w") as f:
-    #     f.write(url)
 
 def get_latest_substack_post_url(substack_url):
     """Fetches the Substack homepage and extracts the URL of the latest post."""
@@ -53,16 +56,15 @@ def get_latest_substack_post_url(substack_url):
         soup = BeautifulSoup(response.content, "html.parser")
         
         # Adjust this selector according to your specific substack website structure
-        # Find the first link that appears to be a blog post link
-        first_post_link = soup.find("a", class_="sitemap-link") #This is a common selector class name
+        first_post_link = soup.find("a", class_="sitemap-link") 
         if not first_post_link:
-            print("Could not find a post link with class name 'post-link'. Check your substack URL and selectors")
+            logger.error("Could not find a post link with class name 'sitemap-link'. Check your substack URL and selectors")
             return None
-        post_url = first_post_link['href'] # Assuming relative URL
+        post_url = first_post_link['href'] 
         return post_url
 
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching Substack homepage: {e}")
+        logger.error(f"Error fetching Substack homepage: {e}")
         return None
 
 def extract_text_from_url(url):
@@ -71,24 +73,22 @@ def extract_text_from_url(url):
         response = requests.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, "html.parser")
-        #Adjust this selector according to your specific substack website structure
-        # Find the main content area (you'll need to inspect the Substack page)
-        content_div = soup.find("div", class_="body") #Or use another appropriate tag/class
+        
+        content_div = soup.find("div", class_="body") 
         if not content_div:
-            print("Could not find the main content div with class name 'body'. Check your substack URL and selectors")
+            logger.error("Could not find the main content div with class name 'body'. Check your substack URL and selectors")
             return None
-        paragraphs = content_div.find_all("p") #Or whatever tag contains the main content
+        paragraphs = content_div.find_all("p") 
         text = "\n".join(p.get_text() for p in paragraphs)
         return text
 
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching or parsing the URL: {e}")
+        logger.error(f"Error fetching or parsing the URL: {e}")
         return None
 
 def summarize_text(text, api_key):
     """Summarizes the text using Google's Gemini API."""
     try:
-        
         prompt = f"Summarize the following text and \
             format it to be sent as HtmlBody parameter in a email API. \
                 Don't add triple backticks to denote the block of text. \
@@ -97,75 +97,145 @@ def summarize_text(text, api_key):
         response = model.generate_content(prompt)
 
         if response.prompt_feedback and response.prompt_feedback.block_reason:
-            print(f"The prompt was blocked because of: {response.prompt_feedback.block_reason}")
+            logger.error(f"The prompt was blocked because of: {response.prompt_feedback.block_reason}")
             return None # Handle the blocked prompt appropriately
 
         return response.text.strip()
 
     except Exception as e:
-        print(f"Error during Gemini summarization: {e}")
+        logger.error(f"Error during Gemini summarization: {e}")
         return None
 
 def send_simple_message(subject, body, sender_email, receiver_email, postmark_server_token):
-    postmark = PostmarkClient(server_token=postmark_server_token)
-    
-    print(
-        postmark.emails.send(
+    try:
+        postmark = PostmarkClient(server_token=postmark_server_token)
+        
+        result = postmark.emails.send(
             From=sender_email,
             To=receiver_email,
             Subject=subject,
             HtmlBody="<p>" + body.replace("\n", "</p><p>") + "</p>",
-            # MessageStream='eas-503-notification', # Optional
-            )
-    )
+        )
+        logger.info(f"Email sent successfully: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
+        return None
 
-def main():
+def worker_process():
     """Main function to orchestrate the process."""
+    global worker_active
     last_processed_url = get_last_processed_url()
-    # print(genai.list_models())
-    while True:
-        latest_post_url = get_latest_substack_post_url(SUBSTACK_URL)
+    
+    logger.info("Background worker started")
+    
+    while worker_active:
+        try:
+            logger.info(f"Checking for new posts at {SUBSTACK_URL}")
+            latest_post_url = get_latest_substack_post_url(SUBSTACK_URL)
 
-        if not latest_post_url:
-            print("Failed to retrieve latest post URL. Retrying...")
+            if not latest_post_url:
+                logger.warning("Failed to retrieve latest post URL. Retrying...")
+                time.sleep(SLEEP_SECONDS)
+                continue
+
+            if latest_post_url != last_processed_url:
+                logger.info(f"New post found: {latest_post_url}")
+                text = extract_text_from_url(latest_post_url)
+
+                if not text:
+                    logger.warning("Failed to extract text. Retrying...")
+                    time.sleep(SLEEP_SECONDS)
+                    continue
+
+                logger.info("Generating summary with Gemini")
+                summary = summarize_text(text, GOOGLE_AI_API_KEY)
+
+                if not summary:
+                    logger.warning("Failed to summarize text. Retrying...")
+                    time.sleep(SLEEP_SECONDS)
+                    continue
+
+                logger.info(f"Sending email summary of {latest_post_url}")
+                
+                send_simple_message(
+                    subject="Summary of the latest EAS503 Substack post",
+                    body=f"Summary of {latest_post_url}:\n\n{summary}",
+                    sender_email=SENDER_EMAIL,
+                    receiver_email=RECEIVER_EMAILS,
+                    postmark_server_token=POSTMARK_SERVER_TOKEN,
+                )
+
+                save_last_processed_url(latest_post_url)
+                last_processed_url = latest_post_url 
+
+            else:
+                logger.info("No new posts found.")
+
+            logger.info(f"Sleeping for {SLEEP_SECONDS} seconds")
             time.sleep(SLEEP_SECONDS)
-            continue
-
-        if latest_post_url != last_processed_url:
-            print(f"New post found: {latest_post_url}")
-            text = extract_text_from_url(latest_post_url)
-
-            if not text:
-                print("Failed to extract text. Retrying...")
-                time.sleep(SLEEP_SECONDS)
-                continue
-
-            summary = summarize_text(text, GOOGLE_AI_API_KEY)
-
-            if not summary:
-                print("Failed to summarize text. Retrying...")
-                time.sleep(SLEEP_SECONDS)
-                continue
-
-            print(f"Summary of {latest_post_url}:\n\n{summary}")
             
-            send_simple_message(
-                subject="Summary of the latest EAS503 Substack post",
-                body=f"Summary of {latest_post_url}:\n\n{summary}",
-                sender_email=SENDER_EMAIL,
-                receiver_email=RECEIVER_EMAILS,
-                postmark_server_token=POSTMARK_SERVER_TOKEN,
-            )
+        except Exception as e:
+            logger.error(f"Error in worker process: {e}")
+            time.sleep(SLEEP_SECONDS)  # Sleep and continue even if there's an error
 
-            save_last_processed_url(latest_post_url)
-            last_processed_url = latest_post_url #Update in memory
+# FastAPI routes
+@app.get("/")
+def index():
+    return {
+        "status": "running",
+        "worker_active": worker_active,
+        "last_processed": last_processed or "None"
+    }
 
-        else:
-            print("No new posts found.")
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
 
-        time.sleep(SLEEP_SECONDS)  # Check every SLEEP_SECONDS seconds
+@app.post("/start")
+def start_worker():
+    global worker_active, worker_thread
+    
+    if not worker_active:
+        worker_active = True
+        worker_thread = threading.Thread(target=worker_process)
+        worker_thread.daemon = True  # This makes the thread exit when the main program exits
+        worker_thread.start()
+        return {"status": "worker started"}
+    else:
+        return {"status": "worker already running"}
 
+@app.post("/stop")
+def stop_worker():
+    global worker_active
+    
+    if worker_active:
+        worker_active = False
+        return {"status": "worker stopping - will finish current cycle"}
+    else:
+        return {"status": "worker not running"}
+
+# Startup event
+@app.on_event("startup")
+def on_startup():
+    global worker_active, worker_thread
+    # Start the background worker
+    worker_active = True
+    worker_thread = threading.Thread(target=worker_process)
+    worker_thread.daemon = True
+    worker_thread.start()
+    logger.info("FastAPI application started with background worker")
+
+# Shutdown event
+@app.on_event("shutdown")
+def on_shutdown():
+    global worker_active
+    worker_active = False
+    logger.info("FastAPI application shutting down, worker stopping")
 
 if __name__ == "__main__":
-    main()
-    # send_simple_message()
+    # Get the port from environment variable for Render compatibility
+    port = int(os.environ.get("PORT", 8080))
+    
+    # Start the FastAPI app with uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
