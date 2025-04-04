@@ -28,6 +28,7 @@ POSTMARK_SERVER_TOKEN = os.getenv("POSTMARK_API_TOKEN")  # Get this from SendGri
 SENDER_EMAIL = os.getenv("EMAIL_SENDER")  # Your email address
 RECEIVER_EMAILS = os.getenv("EMAIL_RECEIVERS")  # Your email address
 SLEEP_SECONDS = int(os.getenv("CHECK_INTERVAL", "3600"))  # Default to 1 hour if not specified
+PING_INTERVAL = 600  # Ping every 10 minutes to prevent idle shutdown
 
 # Configure Gemini
 genai.configure(api_key=GOOGLE_AI_API_KEY)
@@ -37,6 +38,10 @@ model = genai.GenerativeModel('gemini-1.5-pro-latest')
 last_processed = ""
 worker_active = False
 worker_thread = None
+ping_active = False
+ping_thread = None
+# Get the service URL from environment, or default to localhost for development
+SERVICE_URL = os.getenv("SERVICE_URL", "http://localhost:8080")
 
 def get_last_processed_url():
     """Reads the last processed URL from the global variable."""
@@ -179,18 +184,34 @@ def worker_process():
             logger.error(f"Error in worker process: {e}")
             time.sleep(SLEEP_SECONDS)  # Sleep and continue even if there's an error
 
+def self_ping():
+    """Ping itself regularly to prevent Render from shutting down due to inactivity."""
+    global ping_active
+    
+    logger.info(f"Self-ping service started, will ping {SERVICE_URL}/health every {PING_INTERVAL} seconds")
+    
+    while ping_active:
+        try:
+            response = requests.get(f"{SERVICE_URL}/health")
+            logger.info(f"Self-ping: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"Error during self-ping: {e}")
+        
+        time.sleep(PING_INTERVAL)
+
 # FastAPI routes
 @app.get("/")
 def index():
     return {
         "status": "running",
         "worker_active": worker_active,
+        "ping_active": ping_active,
         "last_processed": last_processed or "None"
     }
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "timestamp": time.time()}
 
 @app.post("/start")
 def start_worker():
@@ -218,20 +239,28 @@ def stop_worker():
 # Startup event
 @app.on_event("startup")
 def on_startup():
-    global worker_active, worker_thread
+    global worker_active, worker_thread, ping_active, ping_thread
     # Start the background worker
     worker_active = True
     worker_thread = threading.Thread(target=worker_process)
     worker_thread.daemon = True
     worker_thread.start()
-    logger.info("FastAPI application started with background worker")
+    
+    # Start the self-ping service
+    ping_active = True
+    ping_thread = threading.Thread(target=self_ping)
+    ping_thread.daemon = True
+    ping_thread.start()
+    
+    logger.info("FastAPI application started with background worker and self-ping service")
 
 # Shutdown event
 @app.on_event("shutdown")
 def on_shutdown():
-    global worker_active
+    global worker_active, ping_active
     worker_active = False
-    logger.info("FastAPI application shutting down, worker stopping")
+    ping_active = False
+    logger.info("FastAPI application shutting down, worker and ping service stopping")
 
 if __name__ == "__main__":
     # Get the port from environment variable for Render compatibility
