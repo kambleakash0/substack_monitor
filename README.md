@@ -146,4 +146,4 @@ A `Dockerfile` is provided to build a container image for the application:
 
 ## License
 
-This project is licensed under the terms of the LICENSE file. (Assuming a LICENSE file exists. If not, you might want to add one, e.g., MIT License).
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
