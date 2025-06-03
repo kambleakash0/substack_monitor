@@ -32,7 +32,7 @@ PING_INTERVAL = 600  # Ping every 10 minutes to prevent idle shutdown
 
 # Configure Gemini
 genai.configure(api_key=GOOGLE_AI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-pro-latest')
+model = genai.GenerativeModel('gemini-2.0-flash-lite-001')
 
 # Global vars
 last_processed = ""
